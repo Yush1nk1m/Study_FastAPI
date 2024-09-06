@@ -290,3 +290,31 @@ def test_update_todo(client, mocker):
 ```
 
 `undone()` 메서드의 호출 여부를 검증하기 위해 `mocker.patch.object()`를 사용했다. 그 외의 로직은 POST API와 유사하다.
+
+## 테스트 코드 - DELETE API
+
+마지막으로 DELETE API에 대한 테스트 코드를 작성해 보자.
+
+**src/tests/test_main.py**
+
+```
+def test_delete_todo(client, mocker):
+    # 204
+    mocker.patch(
+        "main.get_todo_by_todo_id",
+        return_value=ToDo(id=1, content="todo", is_done=True)
+    )
+    mocker.patch("main.delete_todo", return_value=None)
+
+    response = client.delete("/todos/1")
+    assert response.status_code == 204
+
+    # 404
+    mocker.patch("main.get_todo_by_todo_id", return_value=None)
+
+    response = client.delete("/todos/1")
+    assert response.status_code == 404
+    assert response.json() == {"detail": "To Do Not Found"}
+```
+
+이렇게 모든 API에 대한 테스트 코드 작성을 마쳤다.
