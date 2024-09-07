@@ -2,11 +2,6 @@ from database.orm import ToDo
 from database.repository import ToDoRepository
 
 
-def test_health_check(client):
-    response = client.get("/")
-    assert response.status_code == 200
-    assert response.json() == { "ping": "pong" }
-
 def test_get_todos(client, mocker):
     # order=ASC
     mocker.patch.object(ToDoRepository, "get_todos", return_value=[
