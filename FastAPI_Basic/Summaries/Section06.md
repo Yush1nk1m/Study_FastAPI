@@ -320,3 +320,274 @@ def test_user_sign_up(client, mocker):
         "username": "test",
     }
 ```
+
+## 로그인 API 구현 & JWT
+
+이번에는 로그인 API를 구현해 보자. JWT 기반의 로그인을 구현할 것이기에 필요한 패키지를 먼저 설치해야 한다.
+
+```
+$ pip install pyjwt
+```
+
+그리고 다음과 같이 API 코드를 작성한다.
+
+**src/api/user.py**
+
+```
+@router.post("/log-in")
+def user_log_in_handler(
+    request: LogInRequest,
+    user_service: UserService = Depends(),
+    user_repo: UserRepository = Depends(),
+):
+    # 1. request body(username, password)
+    # 2. db read user
+    user: User | None = user_repo.get_user_by_username(
+        username=request.username
+    )
+    if not user:
+        raise HTTPException(status_code=404, detail="User Not Found")
+
+    # 3. user.password, request.password -> bcyprt.checkpw
+    verified: bool = user_service.verify_password(
+        plain_password=request.password,
+        hashed_password=user.password,
+    )
+    if not verified:
+        raise HTTPException(status_code=401, detail="Not Authorized")
+
+    # 4. create jwt
+    access_token: str = user_service.create_jwt(username=user.username);
+
+    # 5. return jwt
+    return JWTResponse(access_token=access_token)
+```
+
+전반적인 로직은 요청으로부터 사용자의 `username`, `password`를 받아 데이터베이스에 사용자가 존재하는지 검증하고, 존재한다면 비밀번호가 일치하는지 검증한 후 JWT 토큰을 응답하는 것이다.
+
+**src/database/repository.py**
+
+```
+class UserRepository:
+    def __init__(self, session: Session = Depends(get_db)):
+        self.session = session
+
+    def save_user(self, user: User) -> User:
+        self.session.add(instance=user)
+        self.session.commit()
+        self.session.refresh(instance=user)
+        return user
+
+    def get_user_by_username(self, username: str) -> User | None:
+        return self.session.scalar(
+            select(User).where(username == User.username)
+        )
+```
+
+이를 위해 먼저 리포지토리 계층에선 사용자를 조회하는 메서드를 정의하였다.
+
+**src/service/user.py**
+
+```
+from datetime import timedelta, datetime
+
+import bcrypt
+import jwt
+
+class UserService:
+    encoding: str = "UTF-8"
+    secret_key: str = "8248a69422b08c53133241c24ca55de7ba5b040efb1a870bcbcac4642ac398ae"
+    jwt_algorithm: str = "HS256"
+
+    def hash_password(self, plain_password: str) -> str:
+        hashed_password: bytes = bcrypt.hashpw(
+            plain_password.encode(self.encoding),
+            salt=bcrypt.gensalt()
+        )
+        return hashed_password.decode(self.encoding)
+
+    def verify_password(
+        self,
+        plain_password: str,
+        hashed_password: str,
+    ) -> bool:
+        return bcrypt.checkpw(
+            plain_password.encode(self.encoding),
+            hashed_password.encode(self.encoding),
+        )
+
+    def create_jwt(self, username: str) -> str:
+        return jwt.encode(
+            {
+                "sub": username,
+                "exp": datetime.now() + timedelta(days=1)
+            },
+            self.secret_key,
+            algorithm=self.jwt_algorithm,
+        )
+```
+
+그리고 서비스 계층에선 비밀번호를 검증하는 메서드, JWT 토큰을 생성하는 메서드를 정의하였다.
+
+**src/schema/request.py**
+
+```
+class LogInRequest(BaseModel):
+    username: str
+    password: str
+```
+
+**src/schema/response.py**
+
+```
+class JWTResponse(BaseModel):
+    access_token: str
+```
+
+요청과 응답에 대한 스키마는 위와 같이 정의하였다.
+
+## 로그인 API 테스트
+
+구현한 로그인 API에 대한 테스트는 Swagger API 문서에서 진행해 보자. 먼저 서버를 실행한다.
+
+```
+$ uvicorn main:app --reload
+```
+
+![Swagger Docs](Images/image5.png)
+
+![Log-in response](Images/image6.png)
+
+올바른 데이터로 로그인 요청을 하면 JWT 토큰이 생성되어 응답됨을 확인할 수 있다.
+
+## JWT 인증을 API에 적용하기
+
+JWT 토큰을 발급받았으면 이제 인증이 필요한 API에 대해 토큰을 전달받도록 설정할 수 있다. 특히 JWT 액세스 토큰은 요청 헤더의 `Authorization` 키에 Bearer 토큰으로 전달하는 것이 일반적이므로 그렇게 구현해 보자.
+
+**src/security.py**
+
+```
+from fastapi import Depends, HTTPException
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+
+def get_access_token(
+    auth_header: HTTPAuthorizationCredentials | None = Depends(HTTPBearer(auto_error=False))
+) -> str:
+    if auth_header is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Not Authorized",
+        )
+    return auth_header.credentials # access token
+```
+
+먼저 요청 헤더로부터 JWT 토큰을 추출하는 함수를 정의한다. 이 함수를 의존성 주입 받은 API는 모두 JWT 토큰의 유무를 검사하고, 존재하지 않을 경우 401 에러를 던지게 된다.
+
+**src/api/todo.py**
+
+```
+...
+@router.get("", status_code=200)
+def get_todos_handler(
+        access_token = Depends(get_access_token),
+        order: str | None = None,
+        user_service: UserService = Depends(),
+        user_repo: UserRepository = Depends(),
+        todo_repo: ToDoRepository = Depends(ToDoRepository),
+) -> ToDoListSchema:
+    username: str = user_service.decode_jwt(
+        access_token=access_token,
+    )
+
+    user: User | None = user_repo.get_user_by_username(
+        username=username
+    )
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found",
+        )
+
+    todos: List[ToDo] = user.todos
+
+    if order and order == "DESC":
+        return ToDoListSchema(
+            todos=[
+                ToDoSchema.model_validate(todo)
+                for todo in todos[::-1]
+            ]
+        )
+    else:
+        return ToDoListSchema(
+            todos=[
+                ToDoSchema.model_validate(todo)
+                for todo in todos
+            ]
+        )
+...
+```
+
+먼저 기존에 구현하였던 모든 todo를 조회하는 API를 위와 같이 변경한다. 기존에는 모든 사용자의 모든 todo를 다 불러오는 로직이었지만, 이제는 로그인한 사용자가 작성한 모든 todo를 불러오는 로직으로 변경되었다.
+
+**src/service/user.py**
+
+```
+...
+    def decode_jwt(self, access_token: str) -> str:
+        payload: dict = jwt.decode(
+            access_token,
+            self.secret_key,
+            algorithms=[self.jwt_algorithm],
+        )
+
+        # expire
+        return payload["sub"]
+```
+
+서비스 계층에서는 JWT 토큰을 해독하는 로직을 구현한다. 이렇게 구현한 후 Swagger API 문서에서 **/todos** URI에 요청을 보내면 사용자가 생성한 todo가 잘 조회됨을 확인할 수 있다.
+
+![GET /todos API response](Images/image7.png)
+
+**src/tests/test_todos_api.py**
+
+```
+def test_get_todos(client, mocker):
+    access_token: str = UserService().create_jwt(username="test")
+    headers = {"Authorization": f"Bearer {access_token}"}
+
+    user = User(id=1, username="test", password="hashed")
+    user.todos = [
+        ToDo(id=1, content="FastAPI Section 0", is_done=True),
+        ToDo(id=2, content="FastAPI Section 1", is_done=False),
+    ]
+
+    mocker.patch.object(
+        UserRepository,
+        "get_user_by_username",
+        return_value=user,
+    )
+
+    # order=ASC
+    response = client.get("/todos", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "todos": [
+            {"id": 1, "content": "FastAPI Section 0", "is_done": True},
+            {"id": 2, "content": "FastAPI Section 1", "is_done": False},
+        ]
+    }
+
+    # order=DESC
+    response = client.get("/todos?order=DESC", headers=headers)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "todos": [
+            {"id": 2, "content": "FastAPI Section 1", "is_done": False},
+            {"id": 1, "content": "FastAPI Section 0", "is_done": True},
+        ]
+    }
+```
+
+기존의 테스트 코드도 수정으로 인해 변경이 필요하게 되었다. 위와 같이 수정하면 테스트에 통과하게 된다.
