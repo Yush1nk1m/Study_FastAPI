@@ -591,3 +591,212 @@ def test_get_todos(client, mocker):
 ```
 
 기존의 테스트 코드도 수정으로 인해 변경이 필요하게 되었다. 위와 같이 수정하면 테스트에 통과하게 된다.
+
+## Redis 컨테이너 실행 & Redis 연결
+
+Redis는 Remote Dictionary Server의 줄임말로, 키:값 구조로 데이터를 보관하는 메모리 기반의 NoSQL 데이터베이스이다. 서비스에서는 캐싱 또는 휘발성 데이터를 저장할 때 사용할 수 있다. 이번에는 FastAPI에서 Redis를 활용하는 방법에 대해 알아볼 것이다.
+
+그 전에 먼저 도커 컨테이너를 실행, 필요한 패키지를 설치하고 파이썬 콘솔을 통해 몇 가지 연산을 테스트해 보자.
+
+```
+$ docker run -p 6379:6379 --name redis -d --rm redis
+$ pip install redis
+```
+
+도커 컨테이너 실행 시 `--rm` 옵션을 전달하면 컨테이너가 종료될 때 컨테이너도 함께 삭제된다.
+
+그 다음 파이썬 콘솔에서 다음과 같은 코드를 실행해 보자.
+
+```
+>>> import redis
+>>> redis_client = redis.Redis(host="127.0.0.1", port=6379, db=0, encoding="UTF-8", decode_responses=True)
+>>> redis_client.set("key", "value")
+>>> redis_client.get("key")
+'value'
+>>> redis_client.expire("key", 10)
+True
+>>> redis_client.get("key")
+'value'
+>>> redis_client.get("key")
+
+```
+
+## OTP 생성 API 구현
+
+이번에는 이메일 인증 등 사용자 인증 기능에서 OTP를 사용하는 예시를 API로 구현해볼 것이다. 이메일 전송 기능까지는 구현하지 않고, 이메일로 전송한다고 가정한 후에 로직을 구현한다.
+
+**src/cache.py**
+
+```
+import redis
+
+redis_client = redis.Redis(
+    host="127.0.0.1",
+    port=6379,
+    db=0,
+    encoding="UTF-8",
+    decode_responses=True,
+)
+```
+
+먼저 Redis와 연결하기 위한 파일을 작성한다.
+
+**src/service/user.py**
+
+```
+...
+    @staticmethod
+    def create_otp() -> int:
+        return random.randint(1000, 9999)
+```
+
+그리고 서비스 계층에서는 OTP를 생성하는 메서드를 정의한다.
+
+**src/schema/request.py**
+
+```
+...
+class CreateOTPRequest(BaseModel):
+    email: str
+```
+
+OTP 생성 API의 요청 바디에 대한 스키마도 정의한다.
+
+**src/api/user.py**
+
+```
+...
+# 회원가입(username, password) / 로그인
+# 이메일 알림: 회원가입 -> 이메일 인증(OTP) -> 사용자 이메일 저장 -> 이메일 알림
+
+# POST /users/email/otp -> OTP(key: email, value: random string, exp: 3min)
+
+# POST /users/email/otp/verify -> request(email, OTP) -> user(email)
+
+@router.post("/email/otp")
+def create_otp_handler(
+    request: CreateOTPRequest,
+    _: str = Depends(get_access_token),
+    user_service: UserService = Depends(),
+):
+    # 1. access_token
+    # 2. request body(email)
+    # 3. otp create(random 4 digit)
+    otp: int = user_service.create_otp()
+
+    # 4. redis otp(email, 1234, exp=3min)
+    redis_client.set(request.email, otp)
+    redis_client.expire(request.email, 3 * 60)
+
+    # 5. send otp to email
+    return { "otp": otp }
+
+@router.post("/email/otp/verify")
+def verify_otp_handler():
+    return
+```
+
+OTP 생성 API와 OTP 검증 API가 따로 있다. 일단 OTP 생성 API를 위에 정의한 것들을 활용해 구현하였다. 이메일 전송 기능을 구현하지 않으므로 API 응답으로 생성된 OTP를 노출시킨다.
+
+## OTP 검증 API 구현
+
+이번에는 OTP 검증 API를 구현할 것이다. 앞서 구현한 OTP 생성 API에서는 키를 Redis에 저장했으므로 이번에는 이를 가져오기만 하면 된다.
+
+**src/api/user.py**
+
+```
+...
+@router.post("/email/otp/verify")
+def verify_otp_handler(
+    request: VerifyOTPRequest,
+    access_token: str = Depends(get_access_token),
+    user_service: UserService = Depends(),
+    user_repo: UserRepository = Depends(),
+):
+    # 1. access_token
+    # 2. request_body(email, otp)
+    otp: str | None = redis_client.get(request.email)
+    if not otp:
+        raise HTTPException(status_code=400, detail="Bad Request")
+
+    if request.otp != int(otp):
+        raise HTTPException(status_code=400, detail="Bad Request")
+
+    # 3. request.otp == redis.get(email)
+    username: str = user_service.decode_jwt(access_token=access_token)
+    user: User | None = user_repo.get_user_by_username(username)
+    if not user:
+        raise HTTPException(status_code=404, detail="User Not Found")
+
+    # 4. user(email)
+    return UserSchema.model_validate(user)
+```
+
+Redis 데이터베이스로부터 값을 가져와 비교하고, 사용자가 존재하는지 검증하는 것이 주된 로직이다.
+
+**src/schema/request.py**
+
+```
+...
+class VerifyOTPRequest(BaseModel):
+    email: str
+    otp: int
+```
+
+요청 바디에 대한 스키마는 위와 같다.
+
+## Background Task
+
+비록 이메일 전송 기능을 구현하진 않았지만, 일반적으로 이메일 전송에는 수 초의 시간이 소요된다. 이 시간 동안 클라이언트를 기다리게 한다면 UX를 해치게 될 것이다.
+
+이럴 때 이메일 전송 기능을 백그라운드 작업으로 분류할 수 있다. 이를 위해 기존에 구현한 API를 다음과 같이 수정해 보자. 먼저 이메일 전송에 10초 정도가 소요된다고 가정하고 10초 동안 sleep하는 서비스 메서드를 구현해 보자.
+
+**src/service/user.py**
+
+```
+...
+@staticmethod
+    def send_email_to_user(email: str) -> None:
+        time.sleep(10)
+        print(f"Sending email to {email}!")
+```
+
+그 다음 기존의 API 코드를 다음과 같이 수정한다.
+
+**src/api/user.py**
+
+```
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+...
+@router.post("/email/otp/verify")
+def verify_otp_handler(
+    request: VerifyOTPRequest,
+    background_tasks: BackgroundTasks,
+    access_token: str = Depends(get_access_token),
+    user_service: UserService = Depends(),
+    user_repo: UserRepository = Depends(),
+):
+    # 1. access_token
+    # 2. request_body(email, otp)
+    otp: str | None = redis_client.get(request.email)
+    if not otp:
+        raise HTTPException(status_code=400, detail="Bad Request")
+
+    if request.otp != int(otp):
+        raise HTTPException(status_code=400, detail="Bad Request")
+
+    # 3. request.otp == redis.get(email)
+    username: str = user_service.decode_jwt(access_token=access_token)
+    user: User | None = user_repo.get_user_by_username(username)
+    if not user:
+        raise HTTPException(status_code=404, detail="User Not Found")
+
+    # 4. send email to user
+    background_tasks.add_task(
+        user_service.send_email_to_user,
+        email="admin@fastapi.com"
+    )
+    return UserSchema.model_validate(user)
+```
+
+이렇게 하면 10초 동안 sleep하는 로직은 백그라운드 작업으로 전환되고 클라이언트에게 즉시 응답을 보낼 수 있게 된다.
